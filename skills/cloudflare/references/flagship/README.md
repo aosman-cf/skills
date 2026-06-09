@@ -42,6 +42,8 @@ Feature flag service for controlling feature visibility without redeploying code
 | Design targeting rules & rollouts | `patterns.md` → `gotchas.md` |
 | Debug flag evaluation issues | `gotchas.md` → `api.md` |
 
+REST API note: management endpoints use Cloudflare v4 envelopes (`result`, `result_info`, `errors`) and snake_case fields. The `/evaluate` endpoint is the exception: it is not enveloped and returns OpenFeature-style camelCase.
+
 ## In This Reference
 
 - **[api.md](./api.md)** — REST API endpoints, binding methods, OpenFeature SDK, schemas

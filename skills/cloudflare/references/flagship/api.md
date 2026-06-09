@@ -162,14 +162,23 @@ Base URL: `https://api.cloudflare.com/client/v4/accounts/{account_id}/flagship`
 
 Authentication: `Authorization: Bearer <API_TOKEN>`
 
-Response envelope:
+Management endpoints use the Cloudflare v4 envelope. On success, the payload is under `result`; errors are an array under `errors`.
 
-```json
+```jsonc
 // Success
-{ "success": true, "data": <T> }
+{ "success": true, "result": <T>, "errors": [], "messages": [] }
+
+// Paginated success
+{
+  "success": true,
+  "result": [<T>],
+  "result_info": { "count": 50, "cursor": "next-cursor-or-null" },
+  "errors": [],
+  "messages": []
+}
 
 // Error
-{ "success": false, "error": "message" }
+{ "success": false, "result": null, "errors": [{ "message": "message" }], "messages": [] }
 ```
 
 ### App Endpoints
@@ -201,7 +210,7 @@ App name constraints: alphanumeric + hyphens + underscores, 1-64 chars.
 GET /apps/{app_id}/evaluate?flagKey=<key>&<context-attrs>
 ```
 
-Requires an API token with `flagship:evaluate` permission. Context attributes passed as query params. Returns:
+Requires an API token with `flagship:evaluate` permission. Context attributes passed as query params. This endpoint is not wrapped in the management envelope and returns OpenFeature-style camelCase:
 
 ```json
 {
@@ -209,6 +218,47 @@ Requires an API token with `flagship:evaluate` permission. Context attributes pa
   "value": true,
   "variant": "on",
   "reason": "TARGETING_MATCH"
+}
+```
+
+### Response Shapes
+
+**App result**
+
+```json
+{
+  "id": "app-uuid",
+  "name": "my-app",
+  "created_at": "2026-06-09T12:00:00.000Z",
+  "updated_at": "2026-06-09T12:00:00.000Z",
+  "updated_by": "user@example.com"
+}
+```
+
+**Flag result**
+
+```json
+{
+  "key": "my-flag",
+  "type": "boolean",
+  "default_variation": "off",
+  "variations": { "on": true, "off": false },
+  "rules": [],
+  "description": "Enables the new feature",
+  "enabled": true,
+  "updated_at": "2026-06-09T12:00:00.000Z",
+  "updated_by": "user@example.com"
+}
+```
+
+**Changelog entry**
+
+```json
+{
+  "flag_key": "my-flag",
+  "event": "update",
+  "after": { "key": "my-flag", "default_variation": "off", "variations": { "on": true, "off": false }, "rules": [], "enabled": true },
+  "diff": { "enabled": { "from": false, "to": true } }
 }
 ```
 
@@ -325,7 +375,7 @@ Nesting supported up to 6 levels deep.
 |-------------|---------|
 | 200 | Success (read/update/delete) |
 | 201 | Created (create) |
-| 400 | Validation error (check `error` field) |
+| 400 | Validation error (check `errors[].message`) |
 | 401 | Invalid or missing token |
 | 404 | Flag or app not found |
 | 409 | Flag key already exists (create) |
