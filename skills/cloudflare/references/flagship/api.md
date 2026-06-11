@@ -212,7 +212,7 @@ App name constraints: alphanumeric + hyphens + underscores, 1-64 chars.
 GET /apps/{app_id}/evaluate?flagKey=<key>&<context-attrs>
 ```
 
-Requires an API token with the app-scoped Flagship Evaluate permission (`com.cloudflare.api.account.flagship.app.evaluate`). Context attributes passed as query params. This endpoint is not wrapped in the management envelope; the SDK contract returns OpenFeature-style camelCase:
+Requires an API token with the `com.cloudflare.account.flagship.evaluate` permission. Context attributes passed as query params. This endpoint is not wrapped in the management envelope; the SDK contract returns OpenFeature-style camelCase:
 
 ```json
 {
