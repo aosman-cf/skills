@@ -1,149 +1,72 @@
-# Cloudflare R2 Data Catalog Skill Reference
+# Cloudflare R2 Data Catalog
 
-Expert guidance for Cloudflare R2 Data Catalog - Apache Iceberg catalog built into R2 buckets.
+Managed Apache Iceberg REST catalog built directly into R2 buckets. No catalog servers to run.
 
-## Reading Order
+Your knowledge of catalog URIs, limits, and maintenance behavior may be stale. **Prefer retrieval** — verify against [R2 Data Catalog docs](https://developers.cloudflare.com/r2/data-catalog/) and the live API before citing specific numbers or endpoints.
 
-**New to R2 Data Catalog?** Start here:
-1. Read "What is R2 Data Catalog?" and "When to Use" below
-2. [configuration.md](configuration.md) - Enable catalog, create tokens
-3. [patterns.md](patterns.md) - PyIceberg setup and common patterns
-4. [api.md](api.md) - REST API reference as needed
-5. [gotchas.md](gotchas.md) - Troubleshooting when issues arise
+## What It Provides
 
-**Quick reference?** Jump to:
-- [Enable catalog on bucket](configuration.md#enable-catalog-on-bucket)
-- [PyIceberg connection pattern](patterns.md#pyiceberg-connection-pattern)
-- [Permission errors](gotchas.md#permission-errors)
+- **Apache Iceberg tables** — ACID transactions, schema evolution, time-travel
+- **Zero-egress reads** — query from any cloud/region, no data transfer fees
+- **Standard Iceberg REST API** — works with PyIceberg, PySpark, Snowflake, Trino, DuckDB
+- **Automatic maintenance** — managed compaction and snapshot expiration
+- **Control-plane REST API** — manage catalogs, namespaces, tables, maintenance config
 
-## What is R2 Data Catalog?
+**Status:** Open beta. Pricing announced; **billing not yet enabled** (Cloudflare gives ≥30 days notice). Available to all R2 subscribers.
 
-R2 Data Catalog is a **managed Apache Iceberg REST catalog** built directly into R2 buckets. It provides:
+## Connection Values (Verified Formats)
 
-- **Apache Iceberg tables** - ACID transactions, schema evolution, time-travel queries
-- **Zero-egress costs** - Query from any cloud/region without data transfer fees
-- **Standard REST API** - Works with Spark, PyIceberg, Snowflake, Trino, DuckDB
-- **No infrastructure** - Fully managed, no catalog servers to run
-- **Public beta** - Available to all R2 subscribers, no extra cost beyond R2 storage
+These are the exact formats R2 Data Catalog uses today. The older `https://<account-id>.r2.cloudflarestorage.com/iceberg/<bucket>` form is **wrong** — do not use it.
 
-### What is Apache Iceberg?
+| Value | Format | Example |
+|-------|--------|---------|
+| Catalog URI | `https://catalog.cloudflarestorage.com/{ACCOUNT_ID}/{BUCKET}` | `https://catalog.cloudflarestorage.com/4482a1.../live-data` |
+| Warehouse | `{ACCOUNT_ID}_{BUCKET}` (hyphens in bucket preserved) | `4482a1..._live-data` |
+| Token | R2 API token (Admin R&W on Storage + R&W on Data Catalog) | `cfut_...` |
 
-Open table format for analytics datasets in object storage. Features:
-- **ACID transactions** - Safe concurrent reads/writes
-- **Metadata optimization** - Fast queries without full scans
-- **Schema evolution** - Add/rename/delete columns without rewrites
-- **Time-travel** - Query historical snapshots
-- **Partitioning** - Organize data for efficient queries
-
-## When to Use
-
-**Use R2 Data Catalog for:**
-- **Log analytics** - Store and query application/system logs
-- **Data lakes/warehouses** - Analytical datasets queried by multiple engines
-- **BI pipelines** - Aggregate data for dashboards and reports
-- **Multi-cloud analytics** - Share data across clouds without egress fees
-- **Time-series data** - Event streams, metrics, sensor data
-
-**Don't use for:**
-- **Transactional workloads** - Use D1 or external database instead
-- **Sub-second latency** - Iceberg optimized for batch/analytical queries
-- **Small datasets (<1GB)** - Setup overhead not worth it
-- **Unstructured data** - Store files directly in R2, not as Iceberg tables
+Get these from `npx wrangler r2 bucket catalog enable <bucket>`. The Iceberg `/config` route requires a `?warehouse={WAREHOUSE}` query param.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Query Engines                                  │
-│  (PyIceberg, Spark, Trino, Snowflake, DuckDB)  │
-└────────────────┬────────────────────────────────┘
-                 │
-                 │ REST API (OAuth2 token)
-                 ▼
-┌─────────────────────────────────────────────────┐
-│  R2 Data Catalog (Managed Iceberg REST Catalog)│
-│  • Namespace/table metadata                     │
-│  • Transaction coordination                     │
-│  • Snapshot management                          │
-└────────────────┬────────────────────────────────┘
-                 │
-                 │ Vended credentials
-                 ▼
-┌─────────────────────────────────────────────────┐
-│  R2 Bucket Storage                              │
-│  • Parquet data files                           │
-│  • Metadata files                               │
-│  • Manifest files                               │
-└─────────────────────────────────────────────────┘
+Query/Compute engines (PyIceberg, PySpark, Trino, Snowflake, DuckDB, R2 SQL)
+        │  Iceberg REST API (Bearer token)
+        ▼
+R2 Data Catalog  ── namespace/table metadata, snapshots, transaction coordination
+        │  vended S3 credentials
+        ▼
+R2 Bucket  ── Parquet data files + Iceberg metadata/manifest files
 ```
 
 **Key concepts:**
-- **Catalog URI** - REST endpoint for catalog operations (e.g., `https://<account-id>.r2.cloudflarestorage.com/iceberg/<bucket>`)
-- **Warehouse** - Logical grouping of tables (typically same as bucket name)
-- **Namespace** - Schema/database containing tables (e.g., `logs`, `analytics`)
-- **Table** - Iceberg table with schema, data files, snapshots
-- **Vended credentials** - Temporary S3 credentials catalog provides for data access
+- **Warehouse** — top-level grouping for the catalog (`{ACCOUNT_ID}_{BUCKET}`)
+- **Namespace** — schema/database containing tables (e.g. `logs`, `analytics`); nested namespaces supported
+- **Table** — Iceberg table with schema, partition spec, snapshots
+- **Vended credentials** — temporary S3 creds the catalog hands engines for data access (`X-Iceberg-Access-Delegation: vended-credentials`)
 
-## Limits
+## When to Use
 
-| Resource | Limit | Notes |
-|----------|-------|-------|
-| Namespaces per catalog | No hard limit | Organize tables logically |
-| Tables per namespace | <10,000 recommended | Performance degrades beyond this |
-| Files per table | <100,000 recommended | Run compaction regularly |
-| Snapshots per table | Configurable retention | Expire >7 days old |
-| Partitions per table | 100-1,000 optimal | Too many = slow metadata ops |
-| Table size | Same as R2 bucket | 10GB-10TB+ common |
-| API rate limits | Standard R2 API limits | Shared with R2 storage operations |
-| Target file size | 128-512 MB | After compaction |
+**Use for:** log/analytics data lakes, BI pipelines, time-series/event data, multi-cloud or multi-engine analytics, anything needing ACID + schema evolution on object storage.
 
-## Current Status
+**Don't use for:** transactional/OLTP workloads (use D1 or a database), sub-second point lookups, tiny datasets (<1 GB) where setup overhead isn't justified, or unstructured blobs (store directly in R2).
 
-**Public Beta** (as of Jan 2026)
-- Available to all R2 subscribers
-- No extra cost beyond standard R2 storage/operations
-- Production-ready, but breaking changes possible
-- Supports: namespaces, tables, snapshots, compaction, time-travel, table maintenance
+## Two APIs, Don't Confuse Them
 
-## Decision Tree: Is R2 Data Catalog Right For You?
+| API | Base | Use for |
+|-----|------|---------|
+| **Iceberg REST catalog** | `https://catalog.cloudflarestorage.com/{ACCOUNT_ID}/{BUCKET}` | Table reads/writes via PyIceberg, PySpark, Trino, etc. |
+| **Control-plane REST API** | `https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/r2-catalog/{BUCKET}` | Enable/disable catalog, manage maintenance config, list namespaces/tables, get-table metadata |
 
-```
-Start → Need analytics on object storage data?
-         │
-         ├─ No → Use R2 directly for object storage
-         │
-         └─ Yes → Dataset >1GB with structured schema?
-                  │
-                  ├─ No → Too small, use R2 + ad-hoc queries
-                  │
-                  └─ Yes → Need ACID transactions or schema evolution?
-                           │
-                           ├─ No → Consider simpler solutions (Parquet on R2)
-                           │
-                           └─ Yes → Need multi-cloud/multi-tool access?
-                                    │
-                                    ├─ No → D1 or external DB may be simpler
-                                    │
-                                    └─ Yes → ✅ Use R2 Data Catalog
-```
+## Reading Order
 
-**Quick check:** If you answer "yes" to all:
-- Dataset >1GB and growing
-- Structured/tabular data (logs, events, metrics)
-- Multiple query tools or cloud environments
-- Need versioning, schema changes, or concurrent access
-
-→ R2 Data Catalog is a good fit.
-
-## In This Reference
-
-- **[configuration.md](configuration.md)** - Enable catalog, create API tokens, connect clients
-- **[api.md](api.md)** - REST endpoints, operations, maintenance
-- **[patterns.md](patterns.md)** - PyIceberg examples, common use cases
-- **[gotchas.md](gotchas.md)** - Troubleshooting, best practices, limitations
+1. [configuration.md](configuration.md) — enable catalog, tokens, compaction/snapshot expiration, client connection
+2. [api.md](api.md) — control-plane REST API (incl. new get-table), PyIceberg client API, maintenance
+3. [patterns.md](patterns.md) — PyIceberg + PySpark examples, partitioning, time-travel, external engines
+4. [gotchas.md](gotchas.md) — auth errors, maintenance behavior, limits, troubleshooting
 
 ## See Also
 
-- [Cloudflare R2 Data Catalog Docs](https://developers.cloudflare.com/r2/data-catalog/)
-- [Apache Iceberg Docs](https://iceberg.apache.org/)
-- [PyIceberg Docs](https://py.iceberg.apache.org/)
+- [pipelines](../pipelines/) — stream events into Iceberg tables
+- [r2-sql](../r2-sql/) — serverless SQL over these tables
+- [r2](../r2/) — underlying object storage
+- [R2 Data Catalog docs](https://developers.cloudflare.com/r2/data-catalog/) · [Apache Iceberg](https://iceberg.apache.org/) · [PyIceberg](https://py.iceberg.apache.org/)

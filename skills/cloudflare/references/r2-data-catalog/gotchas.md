@@ -1,170 +1,101 @@
-# Gotchas & Troubleshooting
+# R2 Data Catalog Gotchas
 
-Common problems → causes → solutions.
+Problem → cause → fix. Plus current limits and maintenance behavior.
 
-## Permission Errors
+## Connection / Auth
+
+### Wrong catalog URI or warehouse (most common setup error)
+
+The current formats are:
+- Catalog URI: `https://catalog.cloudflarestorage.com/{ACCOUNT_ID}/{BUCKET}`
+- Warehouse: `{ACCOUNT_ID}_{BUCKET}`
+
+The old `https://<account-id>.r2.cloudflarestorage.com/iceberg/<bucket>` form and "warehouse = bucket name" are **wrong** and will fail. Always take both values from `wrangler r2 bucket catalog enable`.
 
 ### 401 Unauthorized
 
-**Error:** `"401 Unauthorized"`  
-**Cause:** Token missing R2 Data Catalog permissions.  
-**Solution:** Use "Admin Read & Write" token (includes catalog + storage permissions). Test with `catalog.list_namespaces()`.
+Token lacks Data Catalog permission. Use a token with R2 Data Catalog R&W. Test with `catalog.list_namespaces()`.
 
-### 403 Forbidden
+### 403 Forbidden on data files
 
-**Error:** `"403 Forbidden"` on data files  
-**Cause:** Token lacks storage permissions.  
-**Solution:** Token needs both R2 Data Catalog + R2 Storage Bucket Item permissions.
+Token lacks R2 Storage permission. **Admin Read & Write on R2 Storage is required even for read-only data access** during open beta.
 
-### Token Rotation Issues
+### `/config` returns "Warehouse name missing in query param"
 
-**Error:** New token fails after rotation.  
-**Solution:** Create new token → test in staging → update prod → monitor 24h → revoke old.
+The Iceberg `/v1/config` route needs `?warehouse={ACCOUNT_ID}_{BUCKET}`. PyIceberg/PySpark add this automatically when you set `warehouse=`.
 
-## Catalog URI Issues
+## Maintenance Behavior (Updated)
 
-### 404 Not Found
+- **No throughput cap on compaction.** The former 2 GB/hour/table limit has been **lifted** — compaction simply triggers hourly and processes the backlog with no hard cap. Large small-file backlogs still take multiple hourly cycles to fully compact.
+- **Snapshot expiration now deletes data files** (since April 2026), not just metadata. Expiring a snapshot removes data files no longer referenced by retained snapshots. Manual `remove_orphan_files` is rarely needed.
+- **Compaction requires a stored credential.** `wrangler r2 bucket catalog compaction enable` and the dashboard wizard store it automatically; pure-API setups must POST to `/credential`.
+- Compaction is **Parquet-only**; target size 64–512 MB (default 128).
 
-**Error:** `"404 Catalog not found"`  
-**Cause:** Catalog not enabled or wrong URI.  
-**Solution:** Run `wrangler r2 bucket catalog enable <bucket>`. URI must be HTTPS with `/iceberg/` and case-sensitive bucket name.
+## Tables & Schema
 
-### Wrong Warehouse
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `TableAlreadyExistsError` / `NamespaceAlreadyExistsError` | Exists | Use `create_namespace_if_not_exists` / load existing |
+| `NoSuchTableError` | Wrong name or not created | Check namespace+table; create first |
+| `422 Validation` on schema update | Incompatible change (required field, type shrink) | Add nullable columns only; widen types (int→long, float→double) |
+| `TypeError: Cannot cast` on append | PyArrow type ≠ Iceberg schema | Cast to int64 (Iceberg default); check `table.schema()` |
 
-**Error:** Cannot create/load tables.  
-**Cause:** Warehouse ≠ bucket name.  
-**Solution:** Set `warehouse="bucket-name"` to match bucket exactly.
+## Concurrency
 
-## Table and Schema Issues
+- **`CommitFailedException`** — optimistic-locking conflict from simultaneous commits. Add retry with backoff (see [patterns.md](patterns.md#pattern-concurrent-writes-with-retry)).
+- **Stale metadata** after external writes — reload: `table = catalog.load_table(("ns","tbl"))`.
 
-### Table/Namespace Already Exists
+## PySpark / Iceberg
 
-**Error:** `"TableAlreadyExistsError"`  
-**Solution:** Use try/except to load existing or check first.
+| Issue | Fix |
+|-------|-----|
+| Catalog auth fails | Add header `X-Iceberg-Access-Delegation: vended-credentials` |
+| `NoAuthWithAWSException` on orphan removal | Vended creds don't work for orphan removal — supply S3 access/secret keys |
+| Version mismatch errors | Use Iceberg `1.6.1` |
+| Slow first run (~30–60s) | JAR download; cached afterward |
+| Remote signing errors | Set `s3.remote-signing-enabled=false` |
 
-### Namespace Not Found
+## Nested Namespaces
 
-**Error:** Cannot create table.  
-**Solution:** Create namespace first: `catalog.create_namespace("ns")`
+URL separator for nested namespaces in control-plane API paths is **`%1F`** (Unit Separator), not `/` or `.`: `/namespaces/parent%1Fchild/tables`.
 
-### Schema Evolution Errors
+## Query Issues
 
-**Error:** `"422 Validation"` on schema update.  
-**Cause:** Incompatible change (required field, type shrink).  
-**Solution:** Only add nullable columns, compatible type widening (int→long, float→double).
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Empty scan results | Wrong filter / partition column | Test `table.scan().to_pandas()` with no filter first |
+| Slow scans over time | Too many small files | Enable automatic compaction |
 
-## Data and Query Issues
+## Current Limits (Open Beta)
 
-### Empty Scan Results
+| Resource | Recommendation |
+|----------|---------------|
+| Tables per namespace | <10,000 |
+| Files per table | <100,000 (compact regularly) |
+| Partitions per table | 100–1,000 optimal |
+| `get-table` snapshots returned | Max 10 (use `total_snapshots` for full count) |
+| Target file size | 64–512 MB |
 
-**Error:** Scan returns no data.  
-**Cause:** Incorrect filter or partition column.  
-**Solution:** Test without filter first: `table.scan().to_pandas()`. Verify partition column names.
+## Common Error Codes (Control Plane)
 
-### Slow Queries
+| Code | Cause | Fix |
+|------|-------|-----|
+| 401 | Missing/invalid token | Token needs catalog + storage permissions |
+| 403 | Lacks storage permission | Add Admin R&W on R2 Storage |
+| 404 | Catalog not enabled / wrong path | `wrangler r2 bucket catalog enable <bucket>` |
+| 409 | Already enabled/exists | Check status first |
 
-**Error:** Performance degrades over time.  
-**Cause:** Too many small files.  
-**Solution:** Check file count, compact if >1000 or avg <10MB. See [api.md](api.md#compaction).
+## Debug Checklist
 
-### Type Mismatch
+1. `npx wrangler r2 bucket catalog status <bucket>` — enabled?
+2. Token has R2 Storage (Admin R&W) + R2 Data Catalog (R&W)?
+3. `catalog.list_namespaces()` succeeds?
+4. Catalog URI = `catalog.cloudflarestorage.com/{ACCOUNT_ID}/{BUCKET}`, warehouse = `{ACCOUNT_ID}_{BUCKET}`?
+5. Namespace created before `create_table`?
+6. `pip install --upgrade pyiceberg` (recent version)?
+7. Compaction enabled + `credential_status: present`?
 
-**Error:** `"Cannot cast"` on append.  
-**Cause:** PyArrow types don't match Iceberg schema.  
-**Solution:** Cast to int64 (Iceberg default), not int32. Check `table.schema()`.
+## See Also
 
-## Compaction Issues
-
-### Compaction Issues
-
-**Problem:** File count unchanged or compaction takes hours.  
-**Cause:** Target size too large, or table too big for PyIceberg.  
-**Solution:** Only compact if avg <50MB. For >1TB tables, use Spark. Run during low-traffic periods.
-
-## Maintenance Issues
-
-### Snapshot/Orphan Issues
-
-**Problem:** Expiration fails or orphan cleanup deletes active data.  
-**Cause:** Too aggressive retention or wrong order.  
-**Solution:** Always expire snapshots first with `retain_last=10`, then cleanup orphans with 3+ day threshold.
-
-## Concurrency Issues
-
-### Concurrent Write Conflicts
-
-**Problem:** `CommitFailedException` with multiple writers.  
-**Cause:** Optimistic locking - simultaneous commits.  
-**Solution:** Add retry with exponential backoff (see [patterns.md](patterns.md#pattern-6-concurrent-writes-with-retry)).
-
-### Stale Metadata
-
-**Problem:** Old schema/data after external update.  
-**Cause:** Cached metadata.  
-**Solution:** Reload table: `table = catalog.load_table(("ns", "table"))`
-
-## Performance Optimization
-
-### Performance Tips
-
-**Scans:** Use `row_filter` and `selected_fields` to reduce data scanned.  
-**Partitions:** 100-1000 optimal. Avoid high cardinality (millions) or low (<10).  
-**Files:** Keep 100-500MB avg. Compact if <10MB or >10k files.
-
-## Limits
-
-| Resource | Recommended | Impact if Exceeded |
-|----------|-------------|-------------------|
-| Tables/namespace | <10k | Slow list ops |
-| Files/table | <100k | Slow query planning |
-| Partitions/table | 100-1k | Metadata overhead |
-| Snapshots/table | Expire >7d | Metadata bloat |
-
-## Common Error Messages Reference
-
-| Error Message | Likely Cause | Fix |
-|---------------|--------------|-----|
-| `401 Unauthorized` | Missing/invalid token | Check token has catalog+storage permissions |
-| `403 Forbidden` | Token lacks storage permissions | Add R2 Storage Bucket Item permission |
-| `404 Not Found` | Catalog not enabled or wrong URI | Run `wrangler r2 bucket catalog enable` |
-| `409 Conflict` | Table/namespace already exists | Use try/except or load existing |
-| `422 Unprocessable Entity` | Schema validation failed | Check type compatibility, required fields |
-| `CommitFailedException` | Concurrent write conflict | Add retry logic with backoff |
-| `NamespaceAlreadyExistsError` | Namespace exists | Use try/except or load existing |
-| `NoSuchTableError` | Table doesn't exist | Check namespace+table name, create first |
-| `TypeError: Cannot cast` | PyArrow type mismatch | Cast data to match Iceberg schema |
-
-## Debugging Checklist
-
-When things go wrong, check in order:
-
-1. ✅ **Catalog enabled:** `npx wrangler r2 bucket catalog status <bucket>`
-2. ✅ **Token permissions:** Both R2 Data Catalog + R2 Storage in dashboard
-3. ✅ **Connection test:** `catalog.list_namespaces()` succeeds
-4. ✅ **URI format:** HTTPS, includes `/iceberg/`, correct bucket name
-5. ✅ **Warehouse name:** Matches bucket name exactly
-6. ✅ **Namespace exists:** Create before `create_table()`
-7. ✅ **Enable debug logging:** `logging.basicConfig(level=logging.DEBUG)`
-8. ✅ **PyIceberg version:** `pip install --upgrade pyiceberg` (≥0.5.0)
-9. ✅ **File health:** Compact if >1000 files or avg <10MB
-10. ✅ **Snapshot count:** Expire if >100 snapshots
-
-## Enable Debug Logging
-
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)
-# Now operations show HTTP requests/responses
-```
-
-## Resources
-
-- [Cloudflare Community](https://community.cloudflare.com/c/developers/workers/40)
-- [Cloudflare Discord](https://discord.cloudflare.com) - #r2 channel
-- [PyIceberg GitHub](https://github.com/apache/iceberg-python/issues)
-- [Apache Iceberg Slack](https://iceberg.apache.org/community/)
-
-## Next Steps
-
-- [patterns.md](patterns.md) - Working examples
-- [api.md](api.md) - API reference
+- [configuration.md](configuration.md) · [api.md](api.md) · [patterns.md](patterns.md)
+- [R2 Data Catalog docs](https://developers.cloudflare.com/r2/data-catalog/)

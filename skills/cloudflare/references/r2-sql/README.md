@@ -1,128 +1,83 @@
-# Cloudflare R2 SQL Skill Reference
+# Cloudflare R2 SQL
 
-Expert guidance for Cloudflare R2 SQL - serverless distributed query engine for Apache Iceberg tables.
+Serverless, distributed, **read-only** query engine (built on Apache DataFusion) for Apache Iceberg tables in R2 Data Catalog.
 
-## Reading Order
+Your knowledge of R2 SQL's feature set is likely stale — it has expanded fast. **Prefer retrieval and live testing** over assumptions. In particular, JOINs, subqueries, CTEs, set operations, and window functions are **now supported** (older docs say otherwise).
 
-**New to R2 SQL?** Start here:
-1. Read "What is R2 SQL?" and "When to Use" below
-2. [configuration.md](configuration.md) - Enable catalog, create tokens
-3. [patterns.md](patterns.md) - Wrangler CLI and integration examples
-4. [api.md](api.md) - SQL syntax and query reference
-5. [gotchas.md](gotchas.md) - Limitations and troubleshooting
+## What It Is
 
-**Quick reference?** Jump to:
-- [Run a query via Wrangler](patterns.md#wrangler-cli-query)
-- [SQL syntax reference](api.md#sql-syntax)
-- [ORDER BY limitations](gotchas.md#order-by-limitations)
+- **Serverless** — no clusters; query via wrangler CLI, REST API, or from a Worker (HTTP fetch)
+- **Distributed** — coordinator distributes work to DataFusion workers across Cloudflare's network
+- **Zero egress** — query from anywhere without data-transfer fees
+- **Read-only** — no INSERT/UPDATE/DELETE/DDL (use PySpark or PyIceberg to write)
 
-## What is R2 SQL?
+**Status:** Open beta. Pricing announced; **billing not yet enabled** (≥30 days notice).
 
-R2 SQL is Cloudflare's **serverless distributed analytics query engine** for querying Apache Iceberg tables in R2 Data Catalog. Features:
+## Connection Values
 
-- **Serverless** - No clusters to manage, no infrastructure
-- **Distributed** - Leverages Cloudflare's global network for parallel execution
-- **SQL interface** - Familiar SQL syntax for analytics queries
-- **Zero egress fees** - Query from any cloud/region without data transfer costs
-- **Open beta** - Free during beta (standard R2 storage costs apply)
+| Value | Format |
+|-------|--------|
+| REST endpoint | `https://api.sql.cloudflarestorage.com/api/v1/accounts/{ACCOUNT_ID}/r2-sql/query/{BUCKET}` |
+| Wrangler | `npx wrangler r2 sql query "{WAREHOUSE}" "<SQL>"` with `WRANGLER_R2_SQL_AUTH_TOKEN` set |
+| Warehouse | `{ACCOUNT_ID}_{BUCKET}` |
 
-### What is Apache Iceberg?
-
-Open table format for large-scale analytics datasets in object storage:
-- **ACID transactions** - Safe concurrent reads/writes
-- **Metadata optimization** - Fast queries without full table scans
-- **Schema evolution** - Add/rename/drop columns without rewrites
-- **Partitioning** - Organize data for efficient pruning
-
-## When to Use
-
-**Use R2 SQL for:**
-- **Log analytics** - Query application/system logs with WHERE filters and aggregations
-- **BI dashboards** - Generate reports from large analytical datasets
-- **Fraud detection** - Analyze transaction patterns with GROUP BY/HAVING
-- **Multi-cloud analytics** - Query data from any cloud without egress fees
-- **Ad-hoc exploration** - Run SQL queries on Iceberg tables via Wrangler CLI
-
-**Don't use R2 SQL for:**
-- **Workers/Pages runtime** - R2 SQL has no Workers binding, use HTTP API from external systems
-- **Real-time queries (<100ms)** - Optimized for analytical batch queries, not OLTP
-- **Complex joins/CTEs** - Limited SQL feature set (no JOINs, subqueries, CTEs currently)
-- **Small datasets (<1GB)** - Setup overhead not justified
-
-## Decision Tree: Need to Query R2 Data?
-
-```
-Do you need to query structured data in R2?
-├─ YES, data is in Iceberg tables
-│  ├─ Need SQL interface? → Use R2 SQL (this reference)
-│  ├─ Need Python API? → See r2-data-catalog reference (PyIceberg)
-│  └─ Need other engine? → See r2-data-catalog reference (Spark, Trino, etc.)
-│
-├─ YES, but not in Iceberg format
-│  ├─ Streaming data? → Use Pipelines to write to Data Catalog, then R2 SQL
-│  └─ Static files? → Use PyIceberg to create Iceberg tables, then R2 SQL
-│
-└─ NO, just need object storage → Use R2 reference (not R2 SQL)
-```
-
-## Architecture Overview
-
-**Query Planner:**
-- Top-down metadata investigation with multi-layer pruning
-- Partition-level, column-level, and row-group pruning
-- Streaming pipeline - execution starts before planning completes
-- Early termination with LIMIT - stops when result complete
-
-**Query Execution:**
-- Coordinator distributes work to workers across Cloudflare network
-- Workers run Apache DataFusion for parallel query execution
-- Parquet column pruning - reads only required columns
-- Ranged reads from R2 for efficiency
-
-**Aggregation Strategies:**
-- Scatter-gather - simple aggregations (SUM, COUNT, AVG)
-- Shuffling - ORDER BY/HAVING on aggregates via hash partitioning
+> The REST endpoint is `api.sql.cloudflarestorage.com` — **not** `api.cloudflare.com/.../r2/sql`.
 
 ## Quick Start
 
 ```bash
-# 1. Enable R2 Data Catalog on bucket
-npx wrangler r2 bucket catalog enable my-bucket
-
-# 2. Create API token (Admin Read & Write)
-# Dashboard: R2 → Manage API tokens → Create API token
-
-# 3. Set environment variable
-export WRANGLER_R2_SQL_AUTH_TOKEN=<your-token>
-
-# 4. Run query
-npx wrangler r2 sql query "my-bucket" "SELECT * FROM default.my_table LIMIT 10"
+npx wrangler r2 bucket catalog enable my-bucket           # 1. enable catalog
+export WRANGLER_R2_SQL_AUTH_TOKEN=<r2-token>              # 2. auth (Admin R&W + R2 SQL Read)
+npx wrangler r2 sql query "$ACCOUNT_ID"_my-bucket \
+  "SELECT * FROM default.my_table LIMIT 10"                # 3. query
 ```
 
-## Important Limitations
+## What's Supported (verified June 2026)
 
-**CRITICAL: No Workers Binding**
-- R2 SQL cannot be called directly from Workers/Pages code
-- For programmatic access, use HTTP API from external systems
-- Or query via PyIceberg, Spark, etc. (see r2-data-catalog reference)
+✅ `SELECT [DISTINCT]`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`
+✅ **JOINs** (INNER/LEFT/RIGHT/FULL OUTER/CROSS/implicit, multi-way)
+✅ **Subqueries** (IN, EXISTS, scalar, derived tables)
+✅ **CTEs** (`WITH`, multi-table, with JOINs)
+✅ **Set ops** (UNION/UNION ALL, INTERSECT, EXCEPT)
+✅ **Window functions** — full set (`ROW_NUMBER`, `RANK`, `CUME_DIST`, `LAG`/`LEAD`, `NTH_VALUE`, running/framed `SUM/AVG OVER`, `ROWS`/`RANGE`/`GROUPS` frames, `QUALIFY`); inline `OVER (...)` only
+✅ 33 aggregate + 173+ scalar functions, JSON functions, complex types (struct/array/map), `EXPLAIN [FORMAT JSON]`
 
-**SQL Feature Set:**
-- No JOINs, CTEs, subqueries, window functions
-- ORDER BY supports aggregation columns (not just partition keys)
-- LIMIT max 10,000 (default 500)
-- See [gotchas.md](gotchas.md) for complete limitations
+❌ `OFFSET`, named `WINDOW` clause, `func(DISTINCT ...)` on aggregates, `ARRAY_AGG`/`STRING_AGG`, `LATERAL`, `UNNEST`/`PIVOT`, INSERT/UPDATE/DELETE/DDL, `SELECT` without `FROM`
 
-## In This Reference
+See [api.md](api.md) and [gotchas.md](gotchas.md) for the full list and workarounds.
 
-- **[configuration.md](configuration.md)** - Enable catalog, create API tokens
-- **[api.md](api.md)** - SQL syntax, functions, operators, data types
-- **[patterns.md](patterns.md)** - Wrangler CLI, HTTP API, Pipelines, PyIceberg
-- **[gotchas.md](gotchas.md)** - Limitations, troubleshooting, performance tips
+## When to Use
+
+**Use for:** SQL analytics over Iceberg (logs, BI, fraud detection, ad-hoc exploration), multi-cloud queries without egress, dashboards (query from a Worker via HTTP).
+
+**Don't use for:** writes (use PySpark/PyIceberg), real-time OLTP (<100 ms point lookups), windowed analytics needing the named `WINDOW` clause or features below (use PySpark).
+
+## Decision Tree
+
+```
+Query structured data in R2?
+├─ In Iceberg tables
+│  ├─ SQL analytics → R2 SQL (this reference)
+│  └─ Python / write-back / window-clause → PyIceberg / PySpark (r2-data-catalog)
+├─ Not yet Iceberg
+│  ├─ Streaming → Pipelines → Data Catalog → R2 SQL
+│  └─ Static files → PyIceberg/PySpark to create tables → R2 SQL
+└─ Just objects → plain R2
+```
+
+## No Workers Binding
+
+There is no `env.R2_SQL` binding. Query from a Worker via `fetch()` to the REST endpoint with the token as a secret (see [patterns.md](patterns.md#dashboard-worker)).
+
+## Reading Order
+
+1. [configuration.md](configuration.md) — enable catalog, tokens, env setup
+2. [api.md](api.md) — full SQL syntax, functions, data types, response format
+3. [patterns.md](patterns.md) — CLI/REST/Worker queries, JOINs, windows, use cases
+4. [gotchas.md](gotchas.md) — what doesn't work, performance, troubleshooting
 
 ## See Also
 
-- [r2-data-catalog](../r2-data-catalog/) - PyIceberg, REST API, external engines
-- [pipelines](../pipelines/) - Streaming ingestion to Iceberg tables
-- [r2](../r2/) - R2 object storage fundamentals
-- [Cloudflare R2 SQL Docs](https://developers.cloudflare.com/r2-sql/)
-- [R2 SQL Deep Dive Blog](https://blog.cloudflare.com/r2-sql-deep-dive/)
+- [r2-data-catalog](../r2-data-catalog/) — PyIceberg/PySpark, table management
+- [pipelines](../pipelines/) — streaming ingest into queryable tables
+- [R2 SQL docs](https://developers.cloudflare.com/r2-sql/) · [R2 SQL deep-dive blog](https://blog.cloudflare.com/r2-sql-deep-dive/)

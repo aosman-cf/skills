@@ -1,212 +1,95 @@
 # R2 SQL Gotchas
 
-Limitations, troubleshooting, and common pitfalls for R2 SQL.
+Verified against the live engine, June 2026. **Public docs lag the engine** — JOINs, subqueries, CTEs, set operations, and window functions all work now even where docs say "not supported."
 
-## Critical Limitations
+## What Now Works (don't trust stale "unsupported" claims)
 
-### No Workers Binding
+| Feature | Added | Notes |
+|---------|-------|-------|
+| JOINs (INNER/LEFT/RIGHT/FULL OUTER/CROSS/implicit) | May 2026 | Multi-way (3+ tables) too |
+| Subqueries (IN, NOT IN, EXISTS, scalar, derived) | May 2026 | Derived tables can be joined |
+| Multi-table CTEs | May 2026 | Can include JOINs |
+| SELECT DISTINCT | Jun 2026 | All column types |
+| UNION / UNION ALL / INTERSECT / EXCEPT | Jun 2026 | |
+| **Window functions (OVER)** | verified Jun 2026 | Full set: ranking (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`PERCENT_RANK`/`NTILE`/`CUME_DIST`), navigation (`LAG`/`LEAD` w/ offset+default, `FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`), aggregates over windows, all frame types (`ROWS`/`RANGE` incl. `INTERVAL`/`GROUPS`), `QUALIFY`. Inline `OVER(...)` only — see below. |
+| JSON functions | Apr 2026 | `json_get_str/int/float/bool`, `json_contains`, `json_length` |
+| EXPLAIN FORMAT JSON | Apr 2026 | Structured plan output |
+| Unpartitioned tables | Apr 2026 | OK for <1000 files; partition at scale |
 
-**Cannot call R2 SQL from Workers/Pages code** - no binding exists.
+## What Does NOT Work
 
-```typescript
-// ❌ This doesn't exist
-export default {
-  async fetch(request, env) {
-    const result = await env.R2_SQL.query("SELECT * FROM table");  // Not possible
-    return Response.json(result);
-  }
-};
-```
+| Feature | Error / behavior | Workaround |
+|---------|------------------|------------|
+| `OFFSET` | `40003: OFFSET clause is not supported` | Cursor pagination (WHERE + ORDER BY) |
+| Named `WINDOW w AS (...)` clause | `40003: WINDOW clause is not supported` | Inline the `OVER (...)` at each call site (the only window feature missing) |
+| `func(DISTINCT ...)` on aggregates | unsupported | `approx_distinct()` for distinct counts |
+| `ARRAY_AGG` / `STRING_AGG` | blocked (memory safety) | none in R2 SQL |
+| `LATERAL` derived tables | not supported | restructure subqueries |
+| `UNNEST` / `PIVOT` / `UNPIVOT` | not supported | flatten at write time |
+| `map_entries()` on stored columns | `80001` | `map_keys` / `map_values` / `map_extract` |
+| INSERT / UPDATE / DELETE | `only read-only queries` | PySpark / PyIceberg |
+| CREATE / DROP / ALTER | `only read-only queries` | PySpark / PyIceberg / wrangler |
+| `SELECT` without `FROM` | `query must reference at least one table` | reference a table |
 
-**Solutions:**
-- HTTP API from external systems (not Workers)
-- PyIceberg/Spark via r2-data-catalog REST API
-- For Workers, use D1 or external databases
+> No Workers binding for R2 SQL. Query the REST endpoint via `fetch()` from a Worker (see [patterns.md](patterns.md#dashboard-worker)), or use D1 / external DB for OLTP.
 
-### ORDER BY Limitations
-
-Can only order by:
-1. **Partition key columns** - Always supported
-2. **Aggregation functions** - Supported via shuffle strategy
-
-**Cannot order by** regular non-partition columns.
+## Type Safety
 
 ```sql
--- ✅ Valid: ORDER BY partition key
-SELECT * FROM logs.requests ORDER BY timestamp DESC LIMIT 100;
-
--- ✅ Valid: ORDER BY aggregation
-SELECT region, SUM(amount) FROM sales.transactions
-GROUP BY region ORDER BY SUM(amount) DESC;
-
--- ❌ Invalid: ORDER BY non-partition column
-SELECT * FROM logs.requests ORDER BY user_id;
-
--- ❌ Invalid: ORDER BY alias (must repeat function)
-SELECT region, SUM(amount) as total FROM sales.transactions
-GROUP BY region ORDER BY total;  -- Use ORDER BY SUM(amount)
+-- ❌ wrong                          -- ✅ right
+WHERE status = '200'                 WHERE status = 200
+WHERE ts > '2026-01-01'              WHERE ts > '2026-01-01T00:00:00Z'   -- need time + tz
+WHERE method = GET                   WHERE method = 'GET'                -- quote strings
 ```
 
-Check partition spec: `DESCRIBE namespace.table_name`
-
-## SQL Feature Limitations
-
-| Feature | Supported | Notes |
-|---------|-----------|-------|
-| SELECT, WHERE, GROUP BY, HAVING | ✅ | Standard support |
-| COUNT, SUM, AVG, MIN, MAX | ✅ | Standard aggregations |
-| ORDER BY partition/aggregation | ✅ | See above |
-| LIMIT | ✅ | Max 10,000 |
-| Column aliases | ❌ | No AS alias |
-| Expressions in SELECT | ❌ | No col1 + col2 |
-| ORDER BY non-partition | ❌ | Fails at runtime |
-| JOINs, subqueries, CTEs | ❌ | Denormalize at write time |
-| Window functions, UNION | ❌ | Use external engines |
-| INSERT/UPDATE/DELETE | ❌ | Use PyIceberg/Pipelines |
-| Nested columns, arrays, JSON | ❌ | Flatten at write time |
-
-**Workarounds:**
-- No JOINs: Denormalize data or use Spark/PyIceberg
-- No subqueries: Split into multiple queries
-- No aliases: Accept generated names, transform in app
+No implicit conversions. Timestamps must be RFC3339 with timezone; dates ISO 8601.
 
 ## Common Errors
 
-### "Column not found"
-**Cause:** Typo, column doesn't exist, or case mismatch  
-**Solution:** `DESCRIBE namespace.table_name` to check schema
+| Error | Cause | Fix |
+|-------|-------|-----|
+| Column not found | Typo / case / wrong table | `DESCRIBE ns.table` |
+| Type mismatch | Wrong literal type | Match column type exactly |
+| Table not found | Wrong warehouse/namespace | `SHOW DATABASES`; `SHOW TABLES IN ns` |
+| LIMIT exceeds maximum | >10,000 | Cursor pagination with partition filters |
+| No data (unexpected) | Over-filtering | `SELECT COUNT(*)`, remove filters incrementally, `LIMIT 10` to inspect |
+| Token authentication failed | Missing env var | `export WRANGLER_R2_SQL_AUTH_TOKEN=...` |
 
-### "Type mismatch"
-```sql
--- ❌ Wrong types
-WHERE status = '200'              -- string instead of integer
-WHERE timestamp > '2025-01-01'    -- missing time/timezone
+## Limits & Defaults
 
--- ✅ Correct types
-WHERE status = 200
-WHERE timestamp > '2025-01-01T00:00:00Z'
-```
+- **LIMIT:** default 500, max 10,000.
+- **`now()` / `current_time()` quantized to 10 ms** boundaries (security measure, not a bug).
+- Wrangler needs `WRANGLER_R2_SQL_AUTH_TOKEN` — it does **not** reuse `wrangler login` OAuth.
+- Open beta: R2 Storage **Admin Read & Write required even for read-only** queries.
 
-### "ORDER BY column not in partition key"
-**Cause:** Ordering by non-partition column  
-**Solution:** Use partition key, aggregation, or remove ORDER BY. Check: `DESCRIBE table`
+## Performance
 
-### "Token authentication failed"
-```bash
-# Check/set token
-echo $WRANGLER_R2_SQL_AUTH_TOKEN
-export WRANGLER_R2_SQL_AUTH_TOKEN=<your-token>
-
-# Or .env file
-echo "WRANGLER_R2_SQL_AUTH_TOKEN=<your-token>" > .env
-```
-
-### "Table not found"
-```sql
--- Verify catalog and tables
-SHOW DATABASES;
-SHOW TABLES IN namespace_name;
-```
-
-Enable catalog: `npx wrangler r2 bucket catalog enable <bucket>`
-
-### "LIMIT exceeds maximum"
-Max LIMIT is 10,000. For pagination, use WHERE filters with partition keys.
-
-### "No data returned" (unexpected)
-**Debug steps:**
-1. `SELECT COUNT(*) FROM table` - verify data exists
-2. Remove WHERE filters incrementally
-3. `SELECT * FROM table LIMIT 10` - inspect actual data/types
-
-## Performance Issues
-
-### Slow Queries
-
-**Causes:** Too many partitions, large LIMIT, no filters, small files
+- **File count dominates latency.** 200 small files ≈ 4–9 s/query; 10 compacted ≈ 1–3 s. Enable automatic compaction.
+- **Partition + filter:** put `__ingest_ts` (or your partition key) range first in `WHERE`, narrow time windows, add predicates.
+- **Multi-way JOINs on large tables** can exceed resource limits — filter heavily, join through dimension tables, avoid cross-joining large fact tables.
+- **Always `LIMIT`** for early termination.
+- Per-query `metrics` (`files_scanned`, `bytes_scanned`, `cache_hits`) are the primary observability signal — there is no dedicated R2 SQL GraphQL dataset. `bytes_scanned` ≈ billable data.
 
 ```sql
--- ❌ Slow: No filters
-SELECT * FROM logs.requests LIMIT 10000;
-
--- ✅ Fast: Filter on partition key
-SELECT * FROM logs.requests 
-WHERE timestamp >= '2025-01-15T00:00:00Z' AND timestamp < '2025-01-16T00:00:00Z'
-LIMIT 1000;
-
--- ✅ Faster: Multiple filters
-SELECT * FROM logs.requests 
-WHERE timestamp >= '2025-01-15T00:00:00Z' AND status = 404 AND method = 'GET'
-LIMIT 1000;
+-- ❌ slow                                   -- ✅ fast
+SELECT * FROM logs.requests LIMIT 10000;     SELECT * FROM logs.requests
+                                             WHERE __ingest_ts >= '2026-01-15T00:00:00Z'
+                                               AND __ingest_ts <  '2026-01-16T00:00:00Z'
+                                               AND status = 404
+                                             LIMIT 1000;
 ```
 
-**File optimization:**
-- Target Parquet size: 100-500MB compressed
-- Pipelines roll interval: 300+ sec (prod), 10 sec (dev)
-- Run compaction to merge small files
+## Debug Checklist
 
-### Query Timeout
-
-**Solution:** Add restrictive WHERE filters, reduce time range, query smaller intervals
-
-```sql
--- ❌ Times out: Year-long aggregation
-SELECT status, COUNT(*) FROM logs.requests 
-WHERE timestamp >= '2024-01-01T00:00:00Z' GROUP BY status;
-
--- ✅ Faster: Month-long aggregation
-SELECT status, COUNT(*) FROM logs.requests 
-WHERE timestamp >= '2025-01-01T00:00:00Z' AND timestamp < '2025-02-01T00:00:00Z'
-GROUP BY status;
-```
-
-## Best Practices
-
-### Partitioning
-- **Time-series:** Partition by day/hour on timestamp
-- **Avoid:** High-cardinality keys (user_id), >10,000 partitions
-
-```python
-from pyiceberg.partitioning import PartitionSpec, PartitionField
-from pyiceberg.transforms import DayTransform
-
-PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=DayTransform(), name="day"))
-```
-
-### Query Writing
-- **Always use LIMIT** for early termination
-- **Filter on partition keys first** for pruning
-- **Combine filters with AND** for more pruning
-
-```sql
--- Good
-WHERE timestamp >= '2025-01-15T00:00:00Z' AND status = 404 AND method = 'GET' LIMIT 100
-```
-
-### Type Safety
-- Quote strings: `'GET'` not `GET`
-- RFC3339 timestamps: `'2025-01-01T00:00:00Z'` not `'2025-01-01'`
-- ISO dates: `'2025-01-15'` not `'01/15/2025'`
-
-### Data Organization
-- **Pipelines:** Dev `roll_file_time: 10`, Prod `roll_file_time: 300+`
-- **Compression:** Use `zstd`
-- **Maintenance:** Compaction for small files, expire old snapshots
-
-## Debugging Checklist
-
-1. `npx wrangler r2 bucket catalog enable <bucket>` - Verify catalog
-2. `echo $WRANGLER_R2_SQL_AUTH_TOKEN` - Check token
-3. `SHOW DATABASES` - List namespaces
-4. `SHOW TABLES IN namespace` - List tables
-5. `DESCRIBE namespace.table` - Check schema
-6. `SELECT COUNT(*) FROM namespace.table` - Verify data
-7. `SELECT * FROM namespace.table LIMIT 10` - Test simple query
-8. Add filters incrementally
+1. `wrangler r2 bucket catalog enable <bucket>` — catalog on?
+2. `echo $WRANGLER_R2_SQL_AUTH_TOKEN` — token set?
+3. `SHOW DATABASES` → `SHOW TABLES IN ns` → `DESCRIBE ns.table`
+4. `SELECT COUNT(*) FROM ns.table` — data present?
+5. `SELECT * FROM ns.table LIMIT 10` — inspect types
+6. Add filters incrementally; read `metrics` to tune
 
 ## See Also
 
-- [api.md](api.md) - SQL syntax
-- [patterns.md](patterns.md) - Query optimization
-- [configuration.md](configuration.md) - Setup
-- [Cloudflare R2 SQL Docs](https://developers.cloudflare.com/r2-sql/)
+- [api.md](api.md) — syntax & functions · [patterns.md](patterns.md) — examples
+- [configuration.md](configuration.md) — setup
+- [R2 SQL docs](https://developers.cloudflare.com/r2-sql/) (note: may lag the engine)
